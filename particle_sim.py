@@ -11,12 +11,14 @@ import matplotlib.pyplot as plt
 pygame.init()
 
 # Constants
-SCREEN_WIDTH, SCREEN_HEIGHT = 800, 600
-FPS = 60
-lr = .1
-steps = 1
-entropy_norm = 2
-batch_size = 100
+SCREEN_WIDTH, SCREEN_HEIGHT = 800, 800
+RUN_LIMIT = 5000
+FPS = 320
+lr = .12
+steps = 200
+entropy_norm = 10
+batch_size = 50
+gravity_constant = 50
 # Set up the screen
 screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
 pygame.display.set_caption("Orbit")
@@ -27,35 +29,44 @@ clock = pygame.time.Clock()
 class GameObject:
     def __init__(self, x, y, width, height, initial_velocity):
 
-        self.position = torch.stack([x, y], dim=-1).reshape(-1).to(dtype=torch.float32)
-        self.velocity = initial_velocity
-
+        self.position = torch.squeeze(torch.stack([x, y], dim=-1).to(dtype=torch.float32))
+        self.velocity = torch.squeeze(initial_velocity)
         self.width, self.height = width, height
 
     def update(self):
         self.position = self.position + self.velocity
-
+        self.position.clamp(min=-5000, max=5000)
     def apply_force(self, force):
         self.velocity = self.velocity + force
 
-def orbit_quality(object1, stationary_position):
-    # Calculate velocity
-    velocity = object1.velocity
+def orbit_quality(object1, stationary_positions):
+# with torch.autograd.detect_anomaly():
+    # Extract velocities from objects
+    velocities = object1.velocity
 
-    # Calculate the normal vector (perpendicular to velocity)
-    normal = torch.tensor([-velocity[1], velocity[0]], dtype=torch.float32)
+    # Calculate the normal vectors (perpendicular to velocities)
+    # We use a negative sign for the second component to get the perpendicular vector
+    normals = torch.stack([-velocities[:, 1], velocities[:, 0]], dim=1)
 
-    # Calculate vector from moving particle (current position) to stationary particle
-    stationary_vector = stationary_position - object1.position
+    # Calculate vectors from moving particles (current positions) to stationary particles
+    epsilon = 1e-8
+    
+    stationary_vectors = (stationary_positions.detach() - object1.position)
 
     # Normalize the vectors
-    normal_normalized = normal / torch.norm(normal)
-    stationary_vector_normalized = stationary_vector / torch.norm(stationary_vector)
+    # We add a small epsilon to avoid division by zero
+    
 
+    normals_normalized = normals / (torch.norm(normals, dim=1, keepdim=True) + epsilon)
+    
+    stationary_vectors_normalized = stationary_vectors / (torch.norm(stationary_vectors, dim=1, keepdim=True) + epsilon)
     # Calculate the dot product and square it
-    quality = torch.dot(normal_normalized, stationary_vector_normalized)**2
 
-    return quality
+    result = torch.sum((normals_normalized * stationary_vectors_normalized)**2, dim=1, keepdim=True)
+# Take the average of the results
+    average = torch.mean(result)
+    # print(average)
+    return average
 
 def plot_normal(mu_0, variance_0, mu_t, variance_t):
     fig, axs = plt.subplots(1, 2) 
@@ -70,144 +81,182 @@ def plot_normal(mu_0, variance_0, mu_t, variance_t):
 
     plt.show()
 
-def model_entropy(variance_list):
-    return 0.5 * torch.sum(torch.log(2 * torch.pi * torch.e * (variance_list**2)))
-
-def ELBO(likelihood, entropy):
-    return math.log(likelihood) - math.log(entropy)
-
-center_x = torch.tensor([SCREEN_WIDTH/2], requires_grad=True)
-center_y = torch.tensor([SCREEN_HEIGHT/2], requires_grad=True) 
+center_x = torch.full((batch_size,), SCREEN_WIDTH / 2, requires_grad=True)
+center_y = torch.full((batch_size,), SCREEN_HEIGHT / 2, requires_grad=True)
 
 elbo_list = []
 
 trajectory_best = []
-elbo_best = -10.0
+elbo_best = 10.0
+epsilon = 1e-6
+
+fx_a, fx_v = torch.tensor([epsilon], requires_grad=True), torch.tensor([0.5], requires_grad=True)
+fy_a, fy_v = torch.tensor([epsilon], requires_grad=True), torch.tensor([0.5], requires_grad=True)
+px_a, px_v = torch.tensor([epsilon], requires_grad=True), torch.tensor([0.66], requires_grad=True)
+py_a, py_v = torch.tensor([epsilon], requires_grad=True), torch.tensor([0.66], requires_grad=True)
 
 
-fx_a, fx_v = torch.tensor([-0.10000000149011612], requires_grad=True), torch.tensor([-0.09999984502792358], requires_grad=True)
-fy_a, fy_v = torch.tensor([0.30000007152557373], requires_grad=True), torch.tensor([0.09999991953372955], requires_grad=True)
-px_a, px_v = torch.tensor([0.7600], requires_grad=True), torch.tensor([0.0000052], requires_grad=True)
-py_a, py_v = torch.tensor([-1.4], requires_grad=True), torch.tensor([0.00000005], requires_grad=True)
+optimizer = torch.optim.Adamax([fx_a, fx_v, fy_a, fy_v, px_a, px_v, py_a, py_v], lr=lr)
+# optimizer = torch.optim.Adam([fx_a, fx_v, fy_a, fy_v], lr=lr)
+distances = []
+torch.autograd.set_detect_anomaly(True)
+try:
+    for _ in range(steps):
+        trajectory = []
+        orbit_tick = torch.tensor([0.0], requires_grad=True)
+        in_range_tick = torch.tensor([0.0], requires_grad=True)
+        velocity_x = dist.Normal(fx_a, (fx_v+epsilon)**2)
+        velocity_y = dist.Normal(fy_a, (fy_v+epsilon)**2)
 
-# optimizer = torch.optim.Adam([fx_a, fx_v, fy_a, fy_v, px_a, px_v, py_a, py_v], lr=lr)
-optimizer = torch.optim.Adam([fx_a, fx_v, fy_a, fy_v], lr=lr)
 
-for _ in range(steps):
-    trajectory = []
-    orbit_tick = torch.tensor([0.0], requires_grad=True)
-    in_range_tick = torch.tensor([1.0], requires_grad=True)
-    velocity_x = dist.Normal(fx_a, fx_v**2)
-    velocity_y = dist.Normal(fy_a, fy_v**2)
+        pos_x =  dist.Normal((px_a)*SCREEN_WIDTH/2, (px_v ** 2)* 200)
+        pos_y =  dist.Normal((py_a)*SCREEN_HEIGHT/2, (py_v ** 2)* 200)
+        initial_velocity =  torch.stack([velocity_x.rsample((batch_size,)), velocity_y.rsample((batch_size,))], dim=-1).to(dtype=torch.float32)
+        # initial_velocity =  torch.stack([torch.zeros((batch_size, 1)), torch.zeros((batch_size, 1))], dim=-1).to(dtype=torch.float32)
+        start_x = torch.reshape(center_x, (batch_size, 1)) + torch.reshape(pos_x.rsample((batch_size,1)), (batch_size, 1))
+        start_y = torch.reshape(center_y, (batch_size, 1)) + torch.reshape(pos_y.rsample((batch_size,1)), (batch_size, 1))
+        objects = GameObject(start_x, start_y, 5, 5, initial_velocity)
+        center = GameObject(center_x, center_y, 5, 5, torch.tensor([0.0, 0.0], dtype=torch.float32, requires_grad=False))
+        last_path_point = objects.position
     
-    for i in range(batch_size):
-        
-
-        pos_x = center_x + dist.Normal(px_a*100, (px_v**2)*1000).rsample()
-        pos_y = center_y + dist.Normal(py_a*100, (py_v**2)*1000).rsample()
-        initial_velocity =  torch.stack([velocity_x.rsample(), velocity_y.rsample()], dim=-1).reshape(-1).to(dtype=torch.float32)
-        object1 = GameObject(pos_x, pos_y, 5, 5, initial_velocity)
-        center = GameObject(center_x, center_y, 5, 5, torch.tensor([0.0, 0.0], dtype=torch.float32, requires_grad=True))
-
-        
-        last_path_point = object1.position
-
         if _ == 0:
             fx_a_start, fx_v_start = float(fx_a), float(fx_v)
             fy_a_start, fy_v_start = float(fy_a), float(fy_v)
             px_a_start, px_v_start = float(px_a), float(px_v)
             py_a_start, py_v_start = float(py_a), float(py_v)
-
+    # with torch.autograd.detect_anomaly():
         while True:
-        # Update game state
-            # (Update positions, check for collisions, etc.)
-            object1.update()
+            # Update game state
+            objects.update()
+            epsilon = 1e-6
             # Revolve around center
-            distance = center.position - object1.position
-            norm = torch.norm(distance, p=2)**2
-            gravity_constant = 10000000  # You may adjust this constant as needed
-            gravity = gravity_constant / norm**2 * distance / norm
-            object1.apply_force(gravity)
-        
-            in_range_tick = in_range_tick + 1
-            orbit_tick = orbit_tick + orbit_quality(object1, center.position)
+            distance = center.position.detach() - objects.position 
+            if(torch.any(distance) == 0):
+                print("ZEROSSS")
+            if(torch.all(distance) != 0):
+                norms = torch.norm(distance, p=2, dim=1, keepdim=True)
+                # You may adjust this constant as needed
+                
+                gravity = (gravity_constant / (norms**2 + epsilon)) * (distance / (norms + epsilon)) + epsilon
 
-            if object1.position[0] < 0 or object1.position[0] > SCREEN_WIDTH or object1.position[1] < 0 or object1.position[1] > SCREEN_HEIGHT:
-                break
+                objects.apply_force(gravity)
+
             
-            last_path_point = object1.position
+
+            in_range_tick = in_range_tick + 1
+
+            last_path_point = objects.position
             trajectory.append(last_path_point)
 
-    # variance_tensor = torch.stack([fx_v, fy_v, px_v, py_v], dim=-1).reshape(-1).to(dtype=torch.float32)
-    variance_tensor = torch.stack([fx_v, fy_v], dim=-1).reshape(-1).to(dtype=torch.float32)
 
-    likelihood = orbit_tick/in_range_tick
-    entropy = model_entropy(variance_tensor)/entropy_norm
-    
-    elbo = torch.log(likelihood) - torch.log(entropy)
-    print("Objectives " + str(float(torch.log(likelihood))), float(torch.log(entropy)), float(elbo))
+            orbit_count = 0
+            out_orbit_count = 0
+            for i in range(batch_size):
+                if objects.position[i, 0] > 0 and objects.position[i, 0] < SCREEN_WIDTH and objects.position[i, 1] > 0 and objects.position[i, 1] < SCREEN_HEIGHT:
+                    orbit_count += 1
+                else:
+                    out_orbit_count += 1
+            
+            orbit_tick = orbit_tick + (((orbit_count)**2)*(orbit_quality(objects, center.position)))*(in_range_tick/RUN_LIMIT)
+            
+            done = False
+            if in_range_tick > RUN_LIMIT:
+                done = True
+            if done:
+                print("simulation done")
 
-    if elbo > elbo_best:
-        elbo_best = elbo.clone()
-        trajectory_best = trajectory.copy()
+                # RENDER EVERY STEP
+                for p in trajectory:
+                    # Handle events
+                    find = False
+                    for event in pygame.event.get():
+                        if event.type == pygame.QUIT:
+                            find=True
+                    if find:
+                        break
 
-    elbo_list.append(float(elbo))
+                    # Render (draw) the game
+                    screen.fill((0, 0, 0))  # Fill the screen with black (or any other color)
+                    points = p.tolist()
+                    # (Draw your game elements here)
+                    for i in range(batch_size):
+                        pygame.draw.rect(screen, (255, 0, 0), pygame.Rect(points[i][0], points[i][1], 5, 5))
+                    
+                    pygame.draw.rect(screen, (0, 0, 255), pygame.Rect(SCREEN_WIDTH/2, SCREEN_HEIGHT/2, 5, 5))
 
-    elbo.backward()
+                    pygame.display.flip()  # Update the full display Surface to the screen
+                        
+                    # Cap the frame rate
+                    clock.tick(FPS)
+                break
+        print("ORBIT TICK: ", orbit_tick, "RUN LIMIT: ", RUN_LIMIT, "BATCH SIZE: ", batch_size)
+        likelihood = torch.log((orbit_tick/RUN_LIMIT)/batch_size)
+        entropy = (pos_x.entropy() + pos_y.entropy() + velocity_x.entropy() + velocity_y.entropy())/entropy_norm
 
-    print("Gradients:")
-    print("fx_a:", float(fx_a))
-    print("fx_v:", float(fx_v))
-    print("fy_a:", float(fy_a))
-    print("fy_v:", float(fy_v))
-    # print("px_a:", float(px_a))
-    # print("px_v:", float(px_v))
-    # print("py_a:", float(py_a))
-    # print("py_v:", float(py_v))
+        elbo = -1*likelihood - entropy 
+        print("Params:")
+        print("fx_a:", float(fx_a))
+        print("fx_v:", float(fx_v))
+        print("fy_a:", float(fy_a))
+        print("fy_v:", float(fy_v))
+        print("px_a:", float(px_a))
+        print("px_v:", float(px_v))
+        print("py_a:", float(py_a))
+        print("py_v:", float(py_v))
 
-    # optimizer = torch.optim.Adam([fx_a, fx_v, fy_a, fy_v, px_a, px_v, py_a, py_v], lr=lr)
-    optimizer = torch.optim.Adam([fx_a, fx_v, fy_a, fy_v], lr=lr)
-
-    # Inside your game loop or after certain iterations
-    optimizer.step()  # Adjust parameters
-    optimizer.zero_grad()  # Clear gradients for the next iteration
-
-print(elbo_best)
-for p in trajectory_best:
-    # Handle  events
-    find = False
-    for event in pygame.event.get():
-        if event.type == pygame.QUIT:
-            find=True
-    if find:
-        break
-    # Render (draw) the game
-    screen.fill((0, 0, 0))  # Fill the screen with black (or any other color)
-    x, y = p.tolist()
-    # (Draw your game elements here)
-    pygame.draw.rect(screen, (255, 0, 0), pygame.Rect(x, y, 5, 5))
-    
-    pygame.draw.rect(screen, (0, 0, 255), pygame.Rect(SCREEN_WIDTH/2, SCREEN_HEIGHT/2, 5, 5))
-
-    pygame.display.flip()  # Update the full display Surface to the screen
+        print("Objectives:  log Likelihood: " + str(float(-1*likelihood)), "    Entropy: " + str(float(entropy)), "   Negative ELBO: " + str(float(elbo)))
+        orbit_tick.retain_grad()
+        in_range_tick.retain_grad()
+        elbo.retain_grad()
+        elbo.backward()
         
-    # Cap the frame rate
-    clock.tick(FPS)
+        # Gradient clipping
+        # torch.nn.utils.clip_grad_norm_(fx_a, 1)
+        # torch.nn.utils.clip_grad_norm_(fy_a, 1)
+        # torch.nn.utils.clip_grad_norm_(fx_v, 1)
+        # torch.nn.utils.clip_grad_norm_(fy_v, 1)
+        # torch.nn.utils.clip_grad_norm_(px_a, 1)
+        # torch.nn.utils.clip_grad_norm_(py_a, 1)
+        # torch.nn.utils.clip_grad_norm_(px_v, 1)
+        # torch.nn.utils.clip_grad_norm_(py_v, 1)
+        print(fx_a.grad, fy_a.grad, fx_v.grad, fy_v.grad, px_a.grad, py_a.grad, px_v.grad, py_v.grad)
+        max_grad = max([fx_a.grad, fx_v.grad, fy_a.grad, fy_v.grad, px_a.grad, px_v.grad,py_a.grad, py_v.grad])
+        min_grad = min([fx_a.grad, fx_v.grad, fy_a.grad, fy_v.grad, px_a.grad, px_v.grad,py_a.grad, py_v.grad])
+
+        fx_v.grad = (fx_v.grad/max_grad)
+        fx_a.grad = (fx_a.grad/max_grad)
+        fy_a.grad = (fy_a.grad/max_grad)
+        fy_v.grad = (fy_v.grad/max_grad)
+        px_a.grad = (px_a.grad/max_grad)
+        px_v.grad = (px_v.grad/max_grad)
+        py_a.grad = (py_a.grad/max_grad)
+        py_v.grad = (py_v.grad/max_grad)
+        # norm = max([torch.abs(fx_a.grad), torch.abs(fx_v.grad), torch.abs(fy_a.grad), torch.abs(fy_v.grad)])
+        # fx_a.grad = fx_a.grad / norm
+        # fx_v.grad = fx_v.grad / norm
+        # fy_a.grad = fx_a.grad / norm
+        # fy_v.grad = fx_v.grad / norm
+
+        print(fx_a.grad, fy_a.grad, fx_v.grad, fy_v.grad, px_a.grad, py_a.grad, px_v.grad, py_v.grad)
+        print(orbit_tick.grad, in_range_tick.grad)
+        print(elbo.grad)
+        # Inside your game loop or after certain iterations
+        optimizer.step() 
+        if elbo.detach() < elbo_best:
+            elbo_best = elbo.detach().clone()
+            trajectory_best = trajectory.copy()
+
+        elbo_list.append(float(elbo.detach()))
+        optimizer.zero_grad()  # Clear gradients for the next iteration
+        print("batch done", _ / steps)
+except Exception as e:
+    print("Training failed")
+    # raise e
 
 time_points = list(range(len(elbo_list)))
 
 # Create the plot
-
-print("FX")
-print(fx_a_start, fx_v_start, fx_a, fx_v)
-print("FY")
-print(fy_a_start, fy_v_start, fy_a, fy_v)
-# print("PX")
-# print(px_a_start, px_v_start, px_a, px_v)
-# print("PY")
-# print(py_a_start, py_v_start, py_a, py_v)
-
-# Show the plot
+FPS = 260
 
 plot_normal(fx_a_start, fx_v_start**2, float(fx_a), float(fx_v**2))
 
@@ -216,7 +265,6 @@ plot_normal(fy_a_start, fy_v_start**2, float(fy_a), float(fy_v**2))
 # plot_normal(px_a_start, (px_v_start**2), float(px_a), float((px_v**2)))
 
 # plot_normal(py_a_start, (py_v_start**2), float(py_a), float((py_v**2)))
-
 
 print(elbo)
 for p in trajectory:
@@ -230,9 +278,10 @@ for p in trajectory:
 
     # Render (draw) the game
     screen.fill((0, 0, 0))  # Fill the screen with black (or any other color)
-    x, y = p.tolist()
+    points = p.tolist()
     # (Draw your game elements here)
-    pygame.draw.rect(screen, (255, 0, 0), pygame.Rect(x, y, 5, 5))
+    for i in range(batch_size):
+        pygame.draw.rect(screen, (255, 0, 0), pygame.Rect(points[i][0], points[i][1], 5, 5))
     
     pygame.draw.rect(screen, (0, 0, 255), pygame.Rect(SCREEN_WIDTH/2, SCREEN_HEIGHT/2, 5, 5))
 
@@ -241,19 +290,36 @@ for p in trajectory:
     # Cap the frame rate
     clock.tick(FPS)
 
-
-print("TRAJECTORY")
-trajectory = [tuple(tensor.tolist()) for tensor in trajectory]
-print(trajectory)
-print("TRAJECTORY BEST")
-trajectory_best = [tuple(tensor.tolist()) for tensor in trajectory_best]
-print(trajectory_best)
 plt.plot(time_points, elbo_list)
 # Add labels and title
 plt.xlabel('Time (Iterations)')
-plt.ylabel('ELBO')
-plt.title('ELBO Over Time')
+plt.ylabel('Negative ELBO')
+plt.title('Negative ELBO Over Time')
 plt.show()
+
+while True:
+    for p in trajectory_best:
+        # Handle  events
+        find = False
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                find=True
+        if find:
+            break
+        # Render (draw) the game
+        screen.fill((0, 0, 0))  # Fill the screen with black (or any other color)
+        
+        points = p.tolist()
+        # (Draw your game elements here)
+        for i in range(batch_size):
+            pygame.draw.rect(screen, (255, 0, 0), pygame.Rect(points[i][0], points[i][1], 5, 5))
+        
+        pygame.draw.rect(screen, (0, 0, 255), pygame.Rect(SCREEN_WIDTH/2, SCREEN_HEIGHT/2, 5, 5))
+
+        pygame.display.flip()  # Update the full display Surface to the screen
+            
+        # Cap the frame rate
+        clock.tick(FPS)
 # Clean up
 pygame.quit()
 sys.exit()
