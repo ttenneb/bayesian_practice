@@ -9,10 +9,10 @@ ELBO is calculated using an approximation for likelihood and the entropy of the 
 Example of training with high entropy priors containing no helpful information. 
 
 ## ElBO over time
-![](https://github.com/ttenneb/bayesian_practice/ELBO RESULTS.png)
+![]("https://github.com/ttenneb/bayesian_practice/ELBO RESULTS.png")
 
 ## Initial distribution before training
-![](https://github.com/ttenneb/bayesian_practice/Initial Trajectories.gif)
+![]("https://github.com/ttenneb/bayesian_practice/Initial Trajectories.gif")
 
 ## Initial distrubution after training
-![](https://github.com/ttenneb/bayesian_practice/Learned Initial Coniditons.gif)
+![]("https://github.com/ttenneb/bayesian_practice/Learned Initial Coniditons.gif")
